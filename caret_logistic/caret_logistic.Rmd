@@ -1,0 +1,231 @@
+---
+title: "Classification with caret in R"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1 R - Preliminaries
+
+## 1.1 Load data and set options
+```{r message=FALSE}
+library(caret)
+library(tidyverse)
+library(corrplot)
+library(xtable)
+library(kableExtra)
+```
+
+```{r}
+data = read.csv('data/loans.csv')
+data_dictionary = read.csv('data/loans_dictionary.csv')
+# use kable to print a nice html table
+select(data_dictionary,c('name','description')) %>%
+  kable %>%
+  kable_styling()
+```
+
+## 1.2 Define target and feature variables
+
+The target variable will be **loan_status** while all the other variables are features. **loan_status** is numerical (0's and 1's), but should be a factor variable for classification in R.  Note, the **total_pymnt** column contains information about whether or not the loan was paid and needs to be removed.
+
+```{r}
+data$loan_status = as.factor(data$loan_status)
+data = select(data,-"total_pymnt")
+```
+
+# Training a Classification Model
+
+Use logistic regression to predict loan defaults.
+
+## 2.1 Split into test and training sets 
+
+Use **createDataPartition** from the `caret` package.
+
+```{r}
+set.seed(100) # for reproducibility
+inTrain = createDataPartition(y = data$loan_status, p = .8, list = FALSE)
+training = slice( data, inTrain ) # slice from dplyr for subsetting
+testing = slice( data, -inTrain)
+```
+
+## 2.2 Simple fit and error estimate
+
+For a simple model that fits all the training data we can use either glm() or the train() function from caret.  
+
+```{r}
+f = as.formula("loan_status~.")
+logisticRegr = glm(f, family = "binomial", data = training )
+# alternately to train using the caret framework for consistency
+#logisticRegr = train(form = f, data = training, method="glm", 
+#                      family = "binomial",trControl = trainControl(method="none"))
+```
+
+Make predictions using the features in the testing data.
+
+```{r}
+y_pred_prob = predict(logisticRegr, testing, type="response")
+y_pred = as.factor(ifelse( y_pred_prob > .5, 1, 0))
+confusionMatrix( y_pred, testing$loan_status )
+```
+
+## 2.3 Other Error Metrics
+
+Plot the ROC curve and display AUC.
+
+```{r}
+library(plotROC)
+rocdata <- data.frame(D = as.integer(testing$loan_status)-1, 
+                      M = y_pred_prob,
+                      Z = ifelse(testing$loan_status=="0","F","S"))
+g <- ggplot(rocdata, aes(m = M, d = D)) + 
+  geom_roc(n.cuts=0) + 
+  coord_equal() +
+  style_roc()
+g + annotate("text", x=0.75, y=0.25, label=paste("AUC =", round((calc_auc(g))$AUC, 4)))
+```
+
+## 2.4 Model Selection Using Cross Validation
+
+In  `caret` the method `glmnet` can be used to do logistic regression with regulatization in the form of a penalty term that corresponds to ridge or lasso regression.  Ridge regression is similar to LogisticRegression in sklearn.  The search grid used for the regularization parameter $\lambda$ is the result of a few iterations of searching in larger grids and refining the range of values.  The glmnet method has trouble with using "0" and "1" for loan status so we replace those with "F" and "S"
+
+```{r cache = TRUE}
+levels(training$loan_status) = c("F","S")
+set.seed(100) # for reproducibility
+tuneGrid <- expand.grid(alpha = 0:1, lambda = seq(0.0001, .001, length = 10))
+trControl = trainControl(method="cv",
+                         number=5,
+                         allowParallel = FALSE,
+                         classProbs = TRUE,
+                         summaryFunction = twoClassSummary)
+best_model <- train( loan_status ~ ., data = training, 
+                method = "glmnet",
+                tuneGrid = tuneGrid, 
+                trControl = trControl,
+                metric = "ROC",
+                preProc = c("center","scale"))
+best_model
+```
+
+The best model was produced using lasso regression ($\alpha = 1$) with regularization parameter $\lambda = 0.0004$. 
+
+```{r}
+y_pred_prob = predict(best_model, testing, type="prob")[,2]
+y_pred = as.factor(ifelse( y_pred_prob > .5, 1, 0))
+confusionMatrix( y_pred, testing$loan_status )
+```
+
+Plot the ROC curve and display AUC.
+
+```{r}
+library(plotROC)
+rocdata <- data.frame(D = as.integer(testing$loan_status)-1, 
+                      M = y_pred_prob,
+                      Z = ifelse(testing$loan_status=="0","F","S"))
+g <- ggplot(rocdata, aes(m = M, d = D)) + 
+  geom_roc(n.cuts=0) + 
+  coord_equal() +
+  style_roc()
+g + annotate("text", x=0.75, y=0.25, label=paste("AUC =", round((calc_auc(g))$AUC, 4)))
+```
+
+Regularized logistic regression did very little to improve the model.
+
+# 3 Other classification models in caret
+
+The beautiful thing about caret is that it's very easy to explore multiples using exactly the same workflow.  Here is an example of building a random forest model while tuning the mtry parameter.  Note:  training random forests in using caret is significantly slower than using the actual package.  I'm not entirely sure why this is.  
+
+```{r cache = TRUE}
+ctrl <- trainControl(method = "cv",
+                     allowParallel = FALSE)
+
+set.seed(100)
+rforest <- train(loan_status ~ ., data = training,
+               method = "rf",
+               ntree = 1000,
+               trControl = ctrl,
+               tuneGrid = data.frame(mtry = 6))
+rforest
+```
+
+```{r}
+y_pred_prob = predict(rforest, testing, type="prob")[,2]
+y_pred = as.factor(ifelse( y_pred_prob > .5, 1, 0))
+confusionMatrix( y_pred, testing$loan_status )
+```
+
+The random forest model is clobbering logistic regression for this data.  Here is the ROC curve:
+
+```{r}
+library(plotROC)
+rocdata <- data.frame(D = as.integer(testing$loan_status)-1, 
+                      M = y_pred_prob,
+                      Z = ifelse(testing$loan_status=="0","F","S"))
+g <- ggplot(rocdata, aes(m = M, d = D)) + 
+  geom_roc(n.cuts=0) + 
+  coord_equal() +
+  style_roc()
+g + annotate("text", x=0.75, y=0.25, label=paste("AUC =", round((calc_auc(g))$AUC, 4)))
+```
+
+Train an xbgoost model.  Also slower training in caret than when using the orginal package. 
+
+```{r}
+levels(training$loan_status) = c("F","S")
+levels(testing$loan_status) = c("F","S")
+library(fastDummies)
+training_numeric <- dummy_cols(training)
+training_numeric <- select(training_numeric,-loan_status_S,-home_ownership,-purpose,-term,
+                               -loan_status_F,-addr_state)
+testing_numeric <- dummy_cols(testing)
+testing_numeric <- select(testing_numeric,-loan_status_S,-home_ownership,-purpose,-term,
+                               -loan_status_F,-addr_state)
+```
+
+```{r}
+library(xgboost)
+
+# split the data into X and y and convert to Dmatrix for xgboost
+X_train = xgb.DMatrix(as.matrix(training_numeric %>% select(-loan_status)))
+y_train = training_numeric$loan_status
+X_test = xgb.DMatrix(as.matrix(testing_numeric %>% select(-loan_status)))
+y_test = testing_numeric$loan_status
+
+xgb_trcontrol = trainControl(
+  method = "cv",
+  number = 5,  
+  allowParallel = FALSE,
+  verboseIter = FALSE,
+  returnData = FALSE,
+  classProbs = TRUE,  
+  summaryFunction = twoClassSummary
+)
+
+
+xgbGrid <- expand.grid(nrounds = 100,
+                       max_depth = 25,
+                       colsample_bytree = .8,
+                       eta = 0.1,
+                       gamma=0,
+                       min_child_weight = 1,
+                       subsample = 1
+                      )
+
+xgb_model = train(
+  X_train, y_train,  
+  trControl = xgb_trcontrol,
+  tuneGrid = xgbGrid,
+  metric = "ROC",
+  method = "xgbTree"
+)
+```
+
+```{r eval = FALSE}
+holdOut = createFolds(training_numeric,k=5)
+xgb_assess = train( )
+```
